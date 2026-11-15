@@ -1,0 +1,8 @@
+node_modules/
+.dsh-pilot/
+*.log
+*.tgz
+.autotest
+screen-*.png
+.DS_Store
+Thumbs.db

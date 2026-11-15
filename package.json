@@ -1,0 +1,54 @@
+{
+  "name": "dsh-shot",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Capture the desktop with a frame selector and drop the crop into the DSH composer as a prompt image — the screenshot entry Doubao and QQ have, added to DeepSeek Harness itself.",
+  "license": "MIT",
+  "author": "loftspire",
+  "icon": "./icon.svg",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/loftspire/dsh-shot.git"
+  },
+  "homepage": "https://github.com/loftspire/dsh-shot#readme",
+  "bugs": {
+    "url": "https://github.com/loftspire/dsh-shot/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "screenshot",
+    "capture",
+    "annotation",
+    "windows",
+    "composer"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}
