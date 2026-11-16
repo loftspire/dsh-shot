@@ -4,8 +4,6 @@ Screenshot button for the DeepSeek Harness composer. Click the camera, the whole
 
 给 DeepSeek Harness 输入框加一个截图按钮：点一下 → 整屏冻结压暗 → 悬停整窗或拖拽框选 → 确认，框到的画面直接成为当前会话的图片附件。
 
-![dsh-shot 的框选界面：整屏压暗，白色虚线选区配八个圆形手柄，左上是 `1155 * 275` 尺寸浮标，选区下方是可拖动位置的工具条「移动 · 矩形 · 椭圆 · 箭头 · 画笔 | 撤销 · 取消 · 确认」](docs/selection.png)
-
 ![dsh-shot 加在 DSH 输入框里的相机按钮，位于「完全权限」标签右侧](docs/entry.png)
 
 框选层不是 DSH 页面里的 DOM，而是宿主另开的**分层窗口**：每个显示器一个无边框置顶窗口，整屏（含任务栏）一起冻结压暗，DSH 主窗口不会被推着缩放再弹回来。版式照着豆包/微信的截图工具走——冻结画面、白色虚线选区配 8 个圆形手柄、选区左上的尺寸浮标（`宽 * 高`）、选区下方一条操作条。
@@ -23,6 +21,16 @@ Screenshot button for the DeepSeek Harness composer. Click the camera, the whole
 ## 安装
 
 插件分两半：host 半（`index.js`，真的抓屏）与 client 半（`client.js`，按钮与兜底遮罩）。
+
+**从 npm 装（推荐）：**
+
+```bash
+dsh plugin add @loftspire/dsh-shot --profile <profile>
+```
+
+装完重启桌面端，输入框左侧即出现相机图标。
+
+**从源码 / 本地目录装：**
 
 1. 取回代码放进任意目录，例如 `D:\plugins\dsh-shot`。
 2. 在 DSH profile 的 `package.json`（`C:\Users\<you>\.dsh\profiles\<profile>\package.json`）里加依赖与 bundle：
