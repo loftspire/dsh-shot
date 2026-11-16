@@ -6,3 +6,4 @@ node_modules/
 screen-*.png
 .DS_Store
 Thumbs.db
+overlay-before-*.ps1

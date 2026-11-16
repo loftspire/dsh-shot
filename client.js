@@ -17,6 +17,7 @@ window.__ModuleLoader__.load({
     const React = require('react')
 
     const CAPTURE_ROUTE = '/dsh-screenshot/capture'
+    const OVERLAY_ROUTE = '/dsh-screenshot/overlay'
     const WINDOW_ROUTE = '/dsh-screenshot/window'
     const LOG_ROUTE = '/dsh-screenshot/log'
     const AUTOTEST_ROUTE = '/dsh-screenshot/autotest'
@@ -445,7 +446,7 @@ window.__ModuleLoader__.load({
         cancelTop.type = 'button'
         cancelTop.addEventListener('click', (event) => {
           event.stopPropagation()
-          finish('cancel')
+          finish('cancel', 'top-cancel')
         })
         cancelCluster.append(escKey, cancelTop)
         root.append(cancelCluster)
@@ -456,8 +457,6 @@ window.__ModuleLoader__.load({
           { id: 'ellipse', label: '椭圆', key: 'O', icon: ICONS.ellipse },
           { id: 'arrow', label: '箭头', key: 'A', icon: ICONS.arrow },
           { id: 'pen', label: '画笔', key: 'P', icon: ICONS.pen },
-          { id: 'text', label: '文字', key: 'T', icon: ICONS.text },
-          { id: 'mosaic', label: '马赛克', key: 'M', icon: ICONS.mosaic },
         ]
 
         const toolBar = h('div', {
@@ -570,7 +569,7 @@ window.__ModuleLoader__.load({
         }
 
         actionBar.append(actionButton(ICONS.copy, '复制', false, () => finish('copy')))
-        actionBar.append(actionButton(ICONS.close, '取消', false, () => finish('cancel')))
+        actionBar.append(actionButton(ICONS.close, '取消', false, () => finish('cancel', 'bar-cancel')))
         actionBar.append(actionButton(ICONS.check, '确认', true, () => finish('confirm')))
         root.append(actionBar)
 
@@ -1023,7 +1022,7 @@ window.__ModuleLoader__.load({
               textInput.value = ''
               return
             }
-            finish('cancel')
+            finish('cancel', 'esc')
             return
           }
           if (textInput.style.display !== 'none') {
@@ -1044,7 +1043,7 @@ window.__ModuleLoader__.load({
             else undo()
             return
           }
-          const shortcut = { r: 'rect', o: 'ellipse', a: 'arrow', p: 'pen', t: 'text', m: 'mosaic' }[event.key.toLowerCase()]
+          const shortcut = { r: 'rect', o: 'ellipse', a: 'arrow', p: 'pen' }[event.key.toLowerCase()]
           if (shortcut !== undefined && state.ready) {
             event.preventDefault()
             setTool(state.tool === shortcut ? null : shortcut)
@@ -1059,7 +1058,7 @@ window.__ModuleLoader__.load({
         })
         root.addEventListener('contextmenu', (event) => {
           event.preventDefault()
-          finish('cancel')
+          finish('cancel', 'contextmenu')
         })
         window.addEventListener('keydown', onKeyDown, true)
 
@@ -1137,7 +1136,7 @@ window.__ModuleLoader__.load({
           root.remove()
         }
 
-        async function finish(action) {
+        async function finish(action, via) {
           if (settled) return
           if (action !== 'cancel' && (!state.ready || state.rect.width < MIN_SELECTION)) {
             toast('先拖拽选出一块区域')
@@ -1146,6 +1145,7 @@ window.__ModuleLoader__.load({
           settled = true
 
           if (action === 'cancel') {
+            report('cancel-via', { via: via ?? 'unknown', ready: state.ready })
             teardown()
             resolve({ action: 'cancel' })
             return
@@ -1455,7 +1455,7 @@ window.__ModuleLoader__.load({
     // "did the page pick up my change" stops being a guess. The floating corner
     // badge this used to draw sat under the app's own status strip, where nobody
     // could see it.
-    const BUILD = '2080'
+    const BUILD = '2200'
 
     /* ------------------------------------------------------------- button */
 
@@ -1478,6 +1478,27 @@ window.__ModuleLoader__.load({
 
     let running = false
 
+    // The native picker draws the dimmed desktop in its own always-on-top
+    // window (one per monitor), so the DSH window is never resized and the
+    // crop is already in physical pixels. Anything unexpected (older host,
+    // no Windows, route error) falls through to the in-page editor below.
+    async function nativePick(hideWindow) {
+      try {
+        const response = await fetch(`${OVERLAY_ROUTE}?hideWindow=${hideWindow ? '1' : '0'}`, {
+          credentials: 'include',
+          cache: 'no-store',
+        })
+        if (response.status === 204) return { status: 'cancelled' }
+        const type = response.headers.get('content-type') ?? ''
+        if (!response.ok || !type.startsWith('image/')) return { status: 'unsupported' }
+        const blob = await response.blob()
+        if (blob.size === 0) return { status: 'unsupported' }
+        return { status: 'ok', blob }
+      } catch {
+        return { status: 'unsupported' }
+      }
+    }
+
     async function runScreenshot() {
       if (running) return
       running = true
@@ -1485,6 +1506,15 @@ window.__ModuleLoader__.load({
       const hideWindow = readHidePreference()
 
       try {
+        const native = await nativePick(hideWindow)
+        report('engine', { native: native.status })
+        if (native.status === 'cancelled') return
+        if (native.status === 'ok') {
+          toast('正在把截图放进输入框…')
+          await attachImage(native.blob)
+          return
+        }
+
         const shot = await captureDesktop(hideWindow)
         report('capture', { width: shot.width, height: shot.height, hideWindow })
         if (hideWindow) await nextFrame()
@@ -1492,12 +1522,11 @@ window.__ModuleLoader__.load({
         const result = await openEditor(shot)
         report('editor', { action: result.action, blobSize: result.blob?.size ?? null })
 
-        if (hideWindow) {
-          // Give the window back its old geometry before touching the
-          // composer, so the attachment lands in the layout the user sees.
-          await releaseWindow()
-          await delay(120)
-        }
+        // The host covers the whole screen for the picker (taskbar included),
+        // so the window has to be handed back every time — even when the user
+        // turned hiding off for the capture itself.
+        await releaseWindow()
+        await delay(120)
 
         if (result.action === 'cancel') return
         if (result.action === 'copy') {
@@ -1511,7 +1540,7 @@ window.__ModuleLoader__.load({
           message: error instanceof Error ? error.message : String(error),
           stack: error instanceof Error ? String(error.stack).slice(0, 600) : null,
         })
-        if (hideWindow) await releaseWindow()
+        await releaseWindow()
         toast(error instanceof Error ? error.message : '截屏失败')
       } finally {
         running = false

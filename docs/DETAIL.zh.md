@@ -1,0 +1,1 @@
+![dsh-shot 加在 DSH 输入框里的相机按钮，位于「完全权限」标签右侧](preview.svg)

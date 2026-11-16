@@ -1,0 +1,1 @@
+![The camera button that dsh-shot adds to the DSH composer, sitting to the right of the permission chip](preview.svg)

@@ -19,7 +19,7 @@
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readFile, unlink, appendFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
@@ -31,10 +31,13 @@ const SCREENSHOT_PATH = '/dsh-screenshot/capture'
 const WINDOW_PATH = '/dsh-screenshot/window'
 const LOG_PATH = '/dsh-screenshot/log'
 const AUTOTEST_PATH = '/dsh-screenshot/autotest'
+const OVERLAY_PATH = '/dsh-screenshot/overlay'
 // Presence of this file makes the browser half probe the composer intake on
 // load and report the outcome; it exists so the attachment path can be tested
 // without asking a person to click through the UI.
 const AUTOTEST_MARKER = fileURLToPath(new URL('./.autotest', import.meta.url))
+const OVERLAY_SCRIPT_PATH = fileURLToPath(new URL('./overlay.ps1', import.meta.url))
+const OVERLAY_TIMEOUT_MS = 240000
 const CAPTURE_TIMEOUT_MS = 25000
 const WINDOW_TIMEOUT_MS = 10000
 const MAX_STDOUT_BYTES = 4096
@@ -60,6 +63,8 @@ public static class Dshss {
   [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+  [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int index);
+  [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] public static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int index, IntPtr value);
 }
 "@
 `
@@ -82,13 +87,14 @@ $state = $env:DSHSS_STATE
 # copy is 1:1 with the panel instead of a scaled-down logical desktop.
 [void][Dshss]::SetProcessDpiAwarenessContext([IntPtr](-4))
 
+# The hwnd is needed even when the caller does not want the window hidden: the
+# picker overlay has to grow to the whole screen afterwards, and only the host
+# side can do that.
 $hwnd = [IntPtr]::Zero
-if ($hide -eq '1') {
-  $proc = Get-Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.ProcessName -eq $owner -and $_.MainWindowHandle -ne 0
-  } | Select-Object -First 1
-  if ($null -ne $proc) { $hwnd = $proc.MainWindowHandle }
-}
+$proc = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+  $_.ProcessName -eq $owner -and $_.MainWindowHandle -ne 0
+} | Select-Object -First 1
+if ($null -ne $proc) { $hwnd = $proc.MainWindowHandle }
 
 $saved = $null
 if ($hwnd -ne [IntPtr]::Zero) {
@@ -101,51 +107,67 @@ if ($hwnd -ne [IntPtr]::Zero) {
     top = $rect.Top
     right = $rect.Right
     bottom = $rect.Bottom
+    style = [Dshss]::GetWindowLongPtr($hwnd, -16).ToInt64()
+    exStyle = [Dshss]::GetWindowLongPtr($hwnd, -20).ToInt64()
   }
   ($saved | ConvertTo-Json -Compress) | Set-Content -LiteralPath $state -Encoding ASCII
 
-  # SW_MINIMIZE: get our own window out of the frame before copying pixels.
-  [void][Dshss]::ShowWindow($hwnd, 6)
-  Start-Sleep -Milliseconds 340
+  if ($hide -eq '1') {
+    # SW_MINIMIZE: get our own window out of the frame before copying pixels.
+    [void][Dshss]::ShowWindow($hwnd, 6)
+    Start-Sleep -Milliseconds 340
+  }
 }
 
+$screenLeft = 0
+$screenTop = 0
+$screenWidth = 0
+$screenHeight = 0
 $captured = $false
 try {
-  $left = [Dshss]::GetSystemMetrics(76)
-  $top = [Dshss]::GetSystemMetrics(77)
-  $width = [Dshss]::GetSystemMetrics(78)
-  $height = [Dshss]::GetSystemMetrics(79)
-  if ($width -le 0 -or $height -le 0) { throw 'the virtual desktop reports no size' }
+  $screenLeft = [Dshss]::GetSystemMetrics(76)
+  $screenTop = [Dshss]::GetSystemMetrics(77)
+  $screenWidth = [Dshss]::GetSystemMetrics(78)
+  $screenHeight = [Dshss]::GetSystemMetrics(79)
+  if ($screenWidth -le 0 -or $screenHeight -le 0) { throw 'the virtual desktop reports no size' }
 
-  $bitmap = New-Object System.Drawing.Bitmap $width, $height, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+  $bitmap = New-Object System.Drawing.Bitmap $screenWidth, $screenHeight, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
   $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-  $graphics.CopyFromScreen($left, $top, 0, 0, $bitmap.Size, [System.Drawing.CopyPixelOperation]::SourceCopy)
+  $graphics.CopyFromScreen($screenLeft, $screenTop, 0, 0, $bitmap.Size, [System.Drawing.CopyPixelOperation]::SourceCopy)
   $graphics.Dispose()
   $bitmap.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
   $bitmap.Dispose()
 
   $captured = $true
-  [Console]::Out.Write("$width,$height,$left,$top")
+  [Console]::Out.Write("$screenWidth,$screenHeight,$screenLeft,$screenTop")
 }
 finally {
   if ($hwnd -ne [IntPtr]::Zero) {
     if ($captured) {
-      # Maximise so the picker overlay covers the whole screen. Topmost is set
-      # only long enough to win the z-order fight, then dropped again.
-      [void][Dshss]::ShowWindow($hwnd, 3)
-      [void][Dshss]::SetWindowPos($hwnd, [IntPtr](-1), 0, 0, 0, 0, 0x0013)
+      # Cover the whole virtual desktop, taskbar included. A maximised window
+      # stops at the work area, so the real taskbar stayed visible underneath
+      # the picker — that is the "two layers" look. QQ and Doubao have no such
+      # seam because their overlay owns the entire screen.
+      # Drop WS_CAPTION|WS_THICKFRAME|WS_SYSMENU|WS_MINIMIZEBOX|WS_MAXIMIZEBOX
+      # so nothing of the old frame peeks out, then place the bare window over
+      # the screen and keep it topmost while the picker is up.
+      $frame = 0x00C00000 -bor 0x00040000 -bor 0x00080000 -bor 0x00020000 -bor 0x00010000
+      [void][Dshss]::SetWindowLongPtr($hwnd, -16, [IntPtr]([int64]$saved.style -band (-bnot $frame)))
+      [void][Dshss]::ShowWindow($hwnd, 9)
+      # HWND_TOPMOST, SWP_FRAMECHANGED | SWP_SHOWWINDOW
+      [void][Dshss]::SetWindowPos($hwnd, [IntPtr](-1), $screenLeft, $screenTop, $screenWidth, $screenHeight, 0x0060)
       [void][Dshss]::BringWindowToTop($hwnd)
       [void][Dshss]::SetForegroundWindow($hwnd)
-      [void][Dshss]::SetWindowPos($hwnd, [IntPtr](-2), 0, 0, 0, 0, 0x0013)
     }
     else {
       # Capture failed: leave the window exactly as it was.
+      [void][Dshss]::SetWindowLongPtr($hwnd, -16, [IntPtr]([int64]$saved.style))
       if ($saved.zoomed) { [void][Dshss]::ShowWindow($hwnd, 3) }
       else {
         [void][Dshss]::ShowWindow($hwnd, 9)
         [void][Dshss]::SetWindowPos(
           $hwnd, [IntPtr](-2), $saved.left, $saved.top,
-          ($saved.right - $saved.left), ($saved.bottom - $saved.top), 0x0014
+          ($saved.right - $saved.left), ($saved.bottom - $saved.top), 0x0034
         )
       }
       [void][Dshss]::SetForegroundWindow($hwnd)
@@ -175,11 +197,29 @@ Remove-Item -LiteralPath $state -Force -ErrorAction SilentlyContinue
 $hwnd = [IntPtr]::new([int64]$saved.hwnd)
 if (-not [Dshss]::IsWindow($hwnd)) { [Console]::Out.Write('gone'); exit 0 }
 
+# The picker ran with the frame styles stripped (see CAPTURE_SCRIPT); putting
+# them back first is what makes the window look like the user left it, and it
+# has to happen before the geometry is applied.
+if ($null -ne $saved.style) {
+  [void][Dshss]::SetWindowLongPtr($hwnd, -16, [IntPtr]([int64]$saved.style))
+  if ($null -ne $saved.exStyle) {
+    [void][Dshss]::SetWindowLongPtr($hwnd, -20, [IntPtr]([int64]$saved.exStyle))
+  }
+}
+
+# Belt and braces: the picker parks the window on top while it is up, and a
+# window that stays on top afterwards is the most visible thing this tool can
+# get wrong, so clear the style bit even if SetWindowPos already did.
+$exStyle = [Dshss]::GetWindowLongPtr($hwnd, -20).ToInt64()
+if (($exStyle -band 0x8) -ne 0) {
+  [void][Dshss]::SetWindowLongPtr($hwnd, -20, [IntPtr]($exStyle -band (-bnot 0x8)))
+}
+
 if ($saved.zoomed) {
   [void][Dshss]::ShowWindow($hwnd, 3)
-  [void][Dshss]::SetWindowPos($hwnd, [IntPtr](-2), 0, 0, 0, 0, 0x0013)
+  [void][Dshss]::SetWindowPos($hwnd, [IntPtr](-2), 0, 0, 0, 0, 0x0033)
   [void][Dshss]::SetForegroundWindow($hwnd)
-  [Console]::Out.Write('maximized')
+  $result = 'maximized'
 }
 else {
   $width = $saved.right - $saved.left
@@ -202,7 +242,7 @@ else {
   # it back to the restore rect before we place it exactly.
   if ([Dshss]::IsZoomed($hwnd)) { [void][Dshss]::ShowWindow($hwnd, 1) }
   # SWP_NOZORDER | SWP_NOACTIVATE
-  [void][Dshss]::SetWindowPos($hwnd, [IntPtr](-2), $saved.left, $saved.top, $width, $height, 0x0014)
+  [void][Dshss]::SetWindowPos($hwnd, [IntPtr](-2), $saved.left, $saved.top, $width, $height, 0x0034)
 
   # A window manager that ignores the first request would leave the user with a
   # window that is not the size they had, so check and insist once.
@@ -213,12 +253,24 @@ else {
   if (-not $placed) {
     [void][Dshss]::ShowWindow($hwnd, 1)
     Start-Sleep -Milliseconds 120
-    [void][Dshss]::SetWindowPos($hwnd, [IntPtr](-2), $saved.left, $saved.top, $width, $height, 0x0014)
+    [void][Dshss]::SetWindowPos($hwnd, [IntPtr](-2), $saved.left, $saved.top, $width, $height, 0x0034)
     $placed = $true
   }
   [void][Dshss]::SetForegroundWindow($hwnd)
-  if ($placed) { [Console]::Out.Write('restored') } else { [Console]::Out.Write('restored-unverified') }
+  if ($placed) { $result = 'restored' } else { $result = 'restored-unverified' }
 }
+
+# Clearing WS_EX_TOPMOST is not enough on its own: the window is still parked in
+# the topmost band, and the SWP_NOZORDER geometry calls above leave the band
+# alone, so Windows writes the bit straight back and the user's window ends up
+# pinned in front of everything. A real z-order change (no SWP_NOZORDER) as the
+# very last act is what actually takes it out of that band.
+$exStyle = [Dshss]::GetWindowLongPtr($hwnd, -20).ToInt64()
+if (($exStyle -band 0x8) -ne 0) {
+  [void][Dshss]::SetWindowLongPtr($hwnd, -20, [IntPtr]($exStyle -band (-bnot 0x8)))
+}
+[void][Dshss]::SetWindowPos($hwnd, [IntPtr](-2), 0, 0, 0, 0, 0x0013)
+[Console]::Out.Write($result)
 `
 
 function connectionOf(ctx) {
@@ -286,6 +338,28 @@ function runPowerShell(script, env, timeoutMs) {
   })
 }
 
+// Restored geometry and the window styles stripped for the picker come back
+// through one state file; if the renderer dies while the picker is up, nothing
+// would ask for that restore and the window would sit frameless over the whole
+// screen, so the host puts it back on its own after a couple of minutes.
+const AUTO_RESTORE_MS = 120000
+let coverGuard = null
+
+function armCoverGuard() {
+  disarmCoverGuard()
+  coverGuard = setTimeout(() => {
+    coverGuard = null
+    void restoreWindow()
+  }, AUTO_RESTORE_MS)
+  if (typeof coverGuard.unref === 'function') coverGuard.unref()
+}
+
+function disarmCoverGuard() {
+  if (coverGuard === null) return
+  clearTimeout(coverGuard)
+  coverGuard = null
+}
+
 async function captureScreen(hideWindow) {
   if (process.platform !== 'win32') {
     return { ok: false, message: 'screen capture is only implemented for Windows' }
@@ -315,6 +389,7 @@ async function captureScreen(hideWindow) {
     const png = await readFile(outPath)
     if (png.length === 0) return { ok: false, message: 'the capture produced an empty file' }
 
+    armCoverGuard()
     return {
       ok: true,
       png,
@@ -333,7 +408,251 @@ async function captureScreen(hideWindow) {
 
 async function restoreWindow() {
   if (process.platform !== 'win32') return { ok: true, message: 'unsupported platform' }
+  disarmCoverGuard()
   return runPowerShell(RESTORE_SCRIPT, { DSHSS_STATE: WINDOW_STATE_PATH }, WINDOW_TIMEOUT_MS)
+}
+
+
+// The native picker needs one frozen frame of the desktop to paint over. The
+// window is minimised for the duration of CopyFromScreen and immediately put
+// back the way it was: no restyle, no pave, no geometry juggling.
+const FREEZE_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class ShotFreeze {
+  [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr v);
+  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
+  [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+  public struct RECT { public int Left, Top, Right, Bottom; }
+}
+"@
+[void][ShotFreeze]::SetProcessDpiAwarenessContext([IntPtr](-4))
+Add-Type -AssemblyName System.Drawing
+$out = $env:DSHSS_OUT
+$owner = $env:DSHSS_OWNER
+$hide = $env:DSHSS_HIDE -eq '1'
+$hwnd = [IntPtr]::Zero
+if ($owner) {
+  $proc = Get-Process -Name $owner -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+  if ($proc) { $hwnd = $proc.MainWindowHandle }
+}
+$zoomed = $false
+$minimized = $false
+if (($hwnd -ne [IntPtr]::Zero) -and $hide) {
+  $zoomed = [ShotFreeze]::IsZoomed($hwnd)
+  [void][ShotFreeze]::ShowWindow($hwnd, 6)
+  $minimized = $true
+  Start-Sleep -Milliseconds 220
+}
+try {
+$left = [ShotFreeze]::GetSystemMetrics(76)
+$top = [ShotFreeze]::GetSystemMetrics(77)
+$width = [ShotFreeze]::GetSystemMetrics(78)
+$height = [ShotFreeze]::GetSystemMetrics(79)
+$bitmap = New-Object System.Drawing.Bitmap $width, $height
+$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+$graphics.CopyFromScreen($left, $top, 0, 0, $bitmap.Size, [System.Drawing.CopyPixelOperation]::SourceCopy)
+$graphics.Dispose()
+$bitmap.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
+$bitmap.Dispose()
+$zoomFlag = if ($zoomed) { '1' } else { '0' }
+Write-Output ("$width,$height,$left,$top|" + [int64]$hwnd + "|" + $zoomFlag)
+} catch {
+  # Never leave the app minimized just because the capture failed.
+  if ($minimized) {
+    if ($zoomed) { [void][ShotFreeze]::ShowWindow($hwnd, 3) } else { [void][ShotFreeze]::ShowWindow($hwnd, 9) }
+    Start-Sleep -Milliseconds 80
+  }
+  throw
+}
+`
+
+// The picker owns the screen; the DSH window stays minimized until it exits, so
+// the user never sees it flash back before the dim layer is up.
+const SHOW_OWNER_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class ShotShow {
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+}
+"@
+$hwnd = [IntPtr][int64]$env:DSHSS_HWND
+if (-not [ShotShow]::IsWindow($hwnd)) { Write-Output 'gone'; exit 0 }
+$mode = 9
+if ($env:DSHSS_ZOOMED -eq '1') { $mode = 3 }
+[void][ShotShow]::ShowWindow($hwnd, $mode)
+Start-Sleep -Milliseconds 90
+[void][ShotShow]::SetForegroundWindow($hwnd)
+Write-Output 'shown'
+`
+
+function runPowerShellFile(file, args, timeoutMs) {
+  return new Promise((resolve) => {
+    const child = spawn(
+      POWERSHELL,
+      ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', file, ...args],
+      { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env } },
+    )
+
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      child.kill()
+      resolve({ ok: false, message: `the picker did not finish within ${Math.round(timeoutMs / 1000)} s` })
+    }, timeoutMs)
+
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (chunk) => {
+      if (stdout.length < MAX_STDOUT_BYTES) stdout += chunk
+    })
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', (chunk) => {
+      if (stderr.length < MAX_STDOUT_BYTES) stderr += chunk
+    })
+
+    child.on('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ ok: false, message: `could not start the picker: ${error.message}` })
+    })
+
+    child.on('close', (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (code !== 0) {
+        const detail = stderr
+          .trim()
+          .split(/\r?\n/)
+          .filter(Boolean)
+          .slice(-3)
+          .join(' ')
+        resolve({ ok: false, message: detail || `the picker exited with code ${code}` })
+        return
+      }
+      resolve({ ok: true, stdout: stdout.trim() })
+    })
+  })
+}
+
+// Freeze the desktop, let the native overlay own the screen for the pick, then
+// hand back the cropped pixels. The overlay window never touches the DSH host
+// window, so nothing resizes while the user is framing.
+/**
+ * Windows PowerShell decodes a .ps1 that lacks a byte-order mark as ANSI, which
+ * turns every Chinese label in the picker overlay into mojibake — the buttons
+ * come out as garbage even though the file itself is valid UTF-8. Editors drop
+ * the BOM without asking, so hand PowerShell a copy that always carries one.
+ */
+function overlayScriptWithBom() {
+  try {
+    const bytes = readFileSync(OVERLAY_SCRIPT_PATH)
+    if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+      return OVERLAY_SCRIPT_PATH
+    }
+    const copy = join(tmpdir(), 'dsh-shot-overlay-bom.ps1')
+    writeFileSync(copy, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), bytes]))
+    return copy
+  } catch {
+    return OVERLAY_SCRIPT_PATH
+  }
+}
+
+async function pickRegionOverlay(hideWindow) {
+  if (process.platform !== 'win32') {
+    return { ok: false, message: 'the native picker is only implemented for Windows' }
+  }
+
+  const frozen = join(tmpdir(), `dsh-shot-frozen-${randomUUID()}.png`)
+  const cropped = join(tmpdir(), `dsh-shot-crop-${randomUUID()}.png`)
+  const started = Date.now()
+
+  try {
+    const freeze = await runPowerShell(
+      FREEZE_SCRIPT,
+      { DSHSS_OUT: frozen, DSHSS_OWNER: 'DeepSeek Harness', DSHSS_HIDE: hideWindow ? '1' : '0' },
+      CAPTURE_TIMEOUT_MS,
+    )
+    if (!freeze.ok) return freeze
+
+    const [geometry, hwndRaw, zoomRaw] = String(freeze.stdout ?? '').trim().split('|')
+    const ownerHwnd = Number.parseInt(hwndRaw ?? '0', 10)
+    const ownerZoomed = zoomRaw === '1'
+    let restored = false
+    const showOwner = async () => {
+      if (restored) return
+      restored = true
+      if (!hideWindow || !Number.isFinite(ownerHwnd) || ownerHwnd <= 0) return
+      await runPowerShell(
+        SHOW_OWNER_SCRIPT,
+        { DSHSS_HWND: String(ownerHwnd), DSHSS_ZOOMED: ownerZoomed ? '1' : '0' },
+        WINDOW_TIMEOUT_MS,
+      )
+    }
+
+    let pick
+    try {
+      pick = await runPowerShellFile(
+        overlayScriptWithBom(),
+        ['-Image', frozen, '-Out', cropped],
+        OVERLAY_TIMEOUT_MS,
+      )
+    } finally {
+      await showOwner()
+    }
+    if (!pick.ok) return pick
+
+    const line = pick.stdout
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter((item) => item.startsWith('{'))
+      .pop()
+    if (line === undefined) {
+      return { ok: false, message: `the picker returned no result: ${JSON.stringify(pick.stdout.slice(0, 200))}` }
+    }
+
+    let parsed
+    try {
+      parsed = JSON.parse(line)
+    } catch {
+      return { ok: false, message: `unreadable picker result: ${JSON.stringify(line.slice(0, 200))}` }
+    }
+
+    if (parsed.cancelled === true) {
+      return { ok: true, cancelled: true, reason: parsed.reason ?? null, elapsedMs: Date.now() - started }
+    }
+
+    const png = await readFile(cropped)
+    if (png.length === 0) return { ok: false, message: 'the picker produced an empty image' }
+
+    return {
+      ok: true,
+      cancelled: false,
+      png,
+      width: Number(parsed.w),
+      height: Number(parsed.h),
+      originX: Number(parsed.x),
+      originY: Number(parsed.y),
+      elapsedMs: Date.now() - started,
+    }
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  } finally {
+    await unlink(frozen).catch(() => {})
+    await unlink(cropped).catch(() => {})
+  }
 }
 
 function reject(req, res, ctx) {
@@ -423,6 +742,41 @@ export function apply(ctx) {
   // open devtools. GET with query parameters is the primary form: a plain
   // cross-origin GET is the request shape the page already proves it can send,
   // while a POST body depends on the desktop protocol forwarding it intact.
+  const overlayHandler = async (req, res) => {
+    if (reject(req, res, ctx)) return
+
+    if (req.method !== 'GET') {
+      res.statusCode = 405
+      res.setHeader('allow', 'GET')
+      res.end()
+      return
+    }
+
+    const hideWindow = searchParams(req, OVERLAY_PATH).get('hideWindow') !== '0'
+    const pick = await pickRegionOverlay(hideWindow)
+    if (!pick.ok) {
+      sendError(res, 500, pick.message)
+      return
+    }
+
+    if (pick.cancelled) {
+      res.statusCode = 204
+      res.setHeader('cache-control', 'no-store')
+      res.end()
+      return
+    }
+
+    res.statusCode = 200
+    res.setHeader('content-type', 'image/png')
+    res.setHeader('cache-control', 'no-store')
+    res.setHeader('x-dsh-shot-width', String(pick.width))
+    res.setHeader('x-dsh-shot-height', String(pick.height))
+    res.setHeader('x-dsh-shot-origin-x', String(pick.originX))
+    res.setHeader('x-dsh-shot-origin-y', String(pick.originY))
+    res.setHeader('x-dsh-shot-ms', String(pick.elapsedMs))
+    res.end(pick.png)
+  }
+
   const logHandler = async (req, res) => {
     if (reject(req, res, ctx)) return
 
@@ -488,6 +842,11 @@ export function apply(ctx) {
     () => ctx.webServer.register({ kind: 'exact', path: LOG_PATH, handler: logHandler }),
     'screenshot: POST /dsh-screenshot/log',
   )
+  ctx.effect(
+    () => ctx.webServer.register({ kind: 'exact', path: OVERLAY_PATH, handler: overlayHandler }),
+    'screenshot: GET /dsh-screenshot/overlay',
+  )
+
   ctx.effect(
     () => ctx.webServer.register({ kind: 'exact', path: AUTOTEST_PATH, handler: autotestHandler }),
     'screenshot: GET /dsh-screenshot/autotest',

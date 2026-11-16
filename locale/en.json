@@ -1,0 +1,8 @@
+{
+  "meta": {
+    "title": "dsh-shot",
+    "description": "Adds a camera button to the DSH composer. Click it and the desktop freezes and dims; drag a rectangle and press 确认 (confirm) to drop that region into the current draft as a prompt image, the way Doubao and QQ screen capture work. The frame layer is a host-side layered window (one borderless always-on-top window per monitor), so the whole screen including the taskbar dims and the DSH window is never resized. Right-click the camera button to toggle hiding the DSH window while capturing (on by default, remembered per machine). Windows only: capture goes through GDI, so a screenshot takes about a second, multi-monitor capture uses the whole virtual desktop, and no other platform fallback exists. The picker's toolbar carries 复制 (copy), 取消 (cancel), 确认 (confirm) plus rectangle, ellipse, arrow and pen marks with undo, and hovering over a window highlights it so a single click grabs that whole window; there is no mosaic tool. Nothing leaves the machine; images go straight into the session draft and are uploaded only when you send the message.",
+    "detail": "docs/DETAIL.md"
+  },
+  "description": "Framed window snapping on hover, click to lock, drag to move, eight handles to resize; colour dim like Doubao (no grayscale); annotations rect/ellipse/arrow/pen with undo; no text marks and no mosaic."
+}

@@ -1,6 +1,6 @@
 {
   "name": "dsh-shot",
-  "version": "0.1.0",
+  "version": "0.2.3",
   "type": "module",
   "description": "Capture the desktop with a frame selector and drop the crop into the DSH composer as a prompt image — the screenshot entry Doubao and QQ have, added to DeepSeek Harness itself.",
   "license": "MIT",
@@ -29,12 +29,17 @@
   },
   "exports": {
     ".": "./index.js",
-    "./client": "./client.js"
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
     "client.js",
+    "overlay.ps1",
     "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
     "icon.svg",
     "README.md",
     "LICENSE"
