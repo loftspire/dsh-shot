@@ -113,10 +113,12 @@ dsh plugin add @loftspire/dsh-shot --profile <profile>
 ## 更新与卸载
 
 - 更新：`git pull`（或重新下载）后按需重启桌面端；只改了 `overlay.ps1` / `index.js` 不必重启——host 每次点击都现起 PowerShell。
-- 卸载：profile `package.json` 里删掉 `dependencies` 与 `dsh.profile.bundles` 两项，删掉 `node_modules\dsh-shot` 联接，重启桌面端。
+- 卸载：profile `package.json` 里删掉 `dependencies` 与 `dsh.profile.bundles` 两项，删掉 `node_modules\@loftspire\dsh-shot` 联接，重启桌面端。
 
 ## 版本
 
+- **0.2.5** —— 修掉改名后的致命问题：`client.js` 的 `__ModuleLoader__.load({ id })` 仍写旧包名，作用域包名下 client 半不注册、相机按钮消失；`id` 已改成 `@loftspire/dsh-shot`。
+- **0.2.4** —— 包名改为 `@loftspire/dsh-shot` 并发布到 npm，同时保留 GitHub Release tarball 安装。
 - **0.2.3** —— 覆盖层整屏化（宿主分层窗口）、悬停即选整窗、选区可移动/八手柄缩放、工具条去掉马赛克与文字、系统十字光标、修复悬停框偏移与工具条中文乱码。
 - **0.2.1** —— 单 Path 挖洞遮罩（消除选区两侧的接缝细线）、箭头改实心带翼、窗口吸附。
 - **0.2.0** —— 原生 WPF 覆盖层（`overlay.ps1`），从页面 DOM 遮罩迁出。

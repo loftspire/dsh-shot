@@ -12,7 +12,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: 'dsh-shot',
+  id: '@loftspire/dsh-shot',
   factory(require) {
     const React = require('react')
 
