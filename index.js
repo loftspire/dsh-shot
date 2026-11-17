@@ -63,6 +63,7 @@ public static class Dshss {
   [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+  [DllImport("user32.dll")] public static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint affinity);
   [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int index);
   [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] public static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int index, IntPtr value);
 }
@@ -113,9 +114,11 @@ if ($hwnd -ne [IntPtr]::Zero) {
   ($saved | ConvertTo-Json -Compress) | Set-Content -LiteralPath $state -Encoding ASCII
 
   if ($hide -eq '1') {
-    # SW_MINIMIZE: get our own window out of the frame before copying pixels.
+    # SW_MINIMIZE for the copy, then SW_RESTORE below. Only the minimise state
+    # is touched - no window styles, no maximise, no resize: those are what once
+    # left the user with a frameless window.
     [void][Dshss]::ShowWindow($hwnd, 6)
-    Start-Sleep -Milliseconds 340
+    Start-Sleep -Milliseconds 260
   }
 }
 
@@ -142,36 +145,21 @@ try {
   [Console]::Out.Write("$screenWidth,$screenHeight,$screenLeft,$screenTop")
 }
 finally {
-  if ($hwnd -ne [IntPtr]::Zero) {
-    if ($captured) {
-      # Cover the whole virtual desktop, taskbar included. A maximised window
-      # stops at the work area, so the real taskbar stayed visible underneath
-      # the picker — that is the "two layers" look. QQ and Doubao have no such
-      # seam because their overlay owns the entire screen.
-      # Drop WS_CAPTION|WS_THICKFRAME|WS_SYSMENU|WS_MINIMIZEBOX|WS_MAXIMIZEBOX
-      # so nothing of the old frame peeks out, then place the bare window over
-      # the screen and keep it topmost while the picker is up.
-      $frame = 0x00C00000 -bor 0x00040000 -bor 0x00080000 -bor 0x00020000 -bor 0x00010000
-      [void][Dshss]::SetWindowLongPtr($hwnd, -16, [IntPtr]([int64]$saved.style -band (-bnot $frame)))
-      [void][Dshss]::ShowWindow($hwnd, 9)
-      # HWND_TOPMOST, SWP_FRAMECHANGED | SWP_SHOWWINDOW
-      [void][Dshss]::SetWindowPos($hwnd, [IntPtr](-1), $screenLeft, $screenTop, $screenWidth, $screenHeight, 0x0060)
-      [void][Dshss]::BringWindowToTop($hwnd)
-      [void][Dshss]::SetForegroundWindow($hwnd)
+  # When the caller defers (DSHSS_DEFER_RESTORE=1) the window stays minimised until
+  # the overlay has finished, so the user never sees a minimise/restore double pop
+  # and the overlay cannot snap onto our own window.
+  if ($hwnd -ne [IntPtr]::Zero -and $hide -eq '1' -and $env:DSHSS_DEFER_RESTORE -ne '1') {
+    if ($saved.zoomed) {
+      [void][Dshss]::ShowWindow($hwnd, 3)
     }
     else {
-      # Capture failed: leave the window exactly as it was.
-      [void][Dshss]::SetWindowLongPtr($hwnd, -16, [IntPtr]([int64]$saved.style))
-      if ($saved.zoomed) { [void][Dshss]::ShowWindow($hwnd, 3) }
-      else {
-        [void][Dshss]::ShowWindow($hwnd, 9)
-        [void][Dshss]::SetWindowPos(
-          $hwnd, [IntPtr](-2), $saved.left, $saved.top,
-          ($saved.right - $saved.left), ($saved.bottom - $saved.top), 0x0034
-        )
-      }
-      [void][Dshss]::SetForegroundWindow($hwnd)
+      [void][Dshss]::ShowWindow($hwnd, 9)
+      [void][Dshss]::SetWindowPos(
+        $hwnd, [IntPtr](-2), $saved.left, $saved.top,
+        ($saved.right - $saved.left), ($saved.bottom - $saved.top), 0x0034
+      )
     }
+    [void][Dshss]::SetForegroundWindow($hwnd)
   }
 }
 `
@@ -184,93 +172,10 @@ $ErrorActionPreference = 'Stop'
   WIN32_TYPES +
   String.raw`
 $state = $env:DSHSS_STATE
-if (-not (Test-Path -LiteralPath $state)) { [Console]::Out.Write('noop'); exit 0 }
-
-# Same DPI context as the capture: the saved rect is in physical pixels, and a
-# process that is not per-monitor aware has its SetWindowPos numbers scaled by
-# the display factor (150% here), which lands the window 1.5x too big.
-[void][Dshss]::SetProcessDpiAwarenessContext([IntPtr](-4))
-
-$saved = Get-Content -LiteralPath $state -Raw | ConvertFrom-Json
 Remove-Item -LiteralPath $state -Force -ErrorAction SilentlyContinue
-
-$hwnd = [IntPtr]::new([int64]$saved.hwnd)
-if (-not [Dshss]::IsWindow($hwnd)) { [Console]::Out.Write('gone'); exit 0 }
-
-# The picker ran with the frame styles stripped (see CAPTURE_SCRIPT); putting
-# them back first is what makes the window look like the user left it, and it
-# has to happen before the geometry is applied.
-if ($null -ne $saved.style) {
-  [void][Dshss]::SetWindowLongPtr($hwnd, -16, [IntPtr]([int64]$saved.style))
-  if ($null -ne $saved.exStyle) {
-    [void][Dshss]::SetWindowLongPtr($hwnd, -20, [IntPtr]([int64]$saved.exStyle))
-  }
-}
-
-# Belt and braces: the picker parks the window on top while it is up, and a
-# window that stays on top afterwards is the most visible thing this tool can
-# get wrong, so clear the style bit even if SetWindowPos already did.
-$exStyle = [Dshss]::GetWindowLongPtr($hwnd, -20).ToInt64()
-if (($exStyle -band 0x8) -ne 0) {
-  [void][Dshss]::SetWindowLongPtr($hwnd, -20, [IntPtr]($exStyle -band (-bnot 0x8)))
-}
-
-if ($saved.zoomed) {
-  [void][Dshss]::ShowWindow($hwnd, 3)
-  [void][Dshss]::SetWindowPos($hwnd, [IntPtr](-2), 0, 0, 0, 0, 0x0033)
-  [void][Dshss]::SetForegroundWindow($hwnd)
-  $result = 'maximized'
-}
-else {
-  $width = $saved.right - $saved.left
-  $height = $saved.bottom - $saved.top
-  # A truncated state file, or a rect written by a process that was not DPI
-  # aware, must not be applied: it would leave the window at a random size.
-  $screenWidth = [Dshss]::GetSystemMetrics(78)
-  $screenHeight = [Dshss]::GetSystemMetrics(79)
-  if ($width -lt 200 -or $height -lt 200 -or
-      ($screenWidth -gt 0 -and $width -gt ($screenWidth * 2)) -or
-      ($screenHeight -gt 0 -and $height -gt ($screenHeight * 2))) {
-    # A truncated state file must not leave the window at a random size.
-    [void][Dshss]::ShowWindow($hwnd, 9)
-    [Console]::Out.Write('invalid-state')
-    exit 0
-  }
-  [void][Dshss]::ShowWindow($hwnd, 9)
-  # The capture parked the window maximized; SW_RESTORE leaves a maximized
-  # window maximized, and SetWindowPos cannot resize one. SW_SHOWNORMAL drops
-  # it back to the restore rect before we place it exactly.
-  if ([Dshss]::IsZoomed($hwnd)) { [void][Dshss]::ShowWindow($hwnd, 1) }
-  # SWP_NOZORDER | SWP_NOACTIVATE
-  [void][Dshss]::SetWindowPos($hwnd, [IntPtr](-2), $saved.left, $saved.top, $width, $height, 0x0034)
-
-  # A window manager that ignores the first request would leave the user with a
-  # window that is not the size they had, so check and insist once.
-  $rect = New-Object 'Dshss+RECT'
-  [void][Dshss]::GetWindowRect($hwnd, [ref]$rect)
-  $placed = ($rect.Left -eq $saved.left) -and ($rect.Top -eq $saved.top) -and
-            (($rect.Right - $rect.Left) -eq $width) -and (($rect.Bottom - $rect.Top) -eq $height)
-  if (-not $placed) {
-    [void][Dshss]::ShowWindow($hwnd, 1)
-    Start-Sleep -Milliseconds 120
-    [void][Dshss]::SetWindowPos($hwnd, [IntPtr](-2), $saved.left, $saved.top, $width, $height, 0x0034)
-    $placed = $true
-  }
-  [void][Dshss]::SetForegroundWindow($hwnd)
-  if ($placed) { $result = 'restored' } else { $result = 'restored-unverified' }
-}
-
-# Clearing WS_EX_TOPMOST is not enough on its own: the window is still parked in
-# the topmost band, and the SWP_NOZORDER geometry calls above leave the band
-# alone, so Windows writes the bit straight back and the user's window ends up
-# pinned in front of everything. A real z-order change (no SWP_NOZORDER) as the
-# very last act is what actually takes it out of that band.
-$exStyle = [Dshss]::GetWindowLongPtr($hwnd, -20).ToInt64()
-if (($exStyle -band 0x8) -ne 0) {
-  [void][Dshss]::SetWindowLongPtr($hwnd, -20, [IntPtr]($exStyle -band (-bnot 0x8)))
-}
-[void][Dshss]::SetWindowPos($hwnd, [IntPtr](-2), 0, 0, 0, 0, 0x0013)
-[Console]::Out.Write($result)
+# The overlay no longer rearranges the host window, so there is nothing to
+# restore. Kept as a route so older clients still get a clean answer.
+[Console]::Out.Write('noop')
 `
 
 function connectionOf(ctx) {
@@ -426,6 +331,10 @@ public class ShotFreeze {
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
   [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+  [DllImport("user32.dll")] public static extern bool SetWindowDisplayAffinity(IntPtr h, uint a);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);
   public struct RECT { public int Left, Top, Right, Bottom; }
 }
 "@
@@ -441,11 +350,37 @@ if ($owner) {
 }
 $zoomed = $false
 $minimized = $false
+$savedRect = New-Object 'ShotFreeze+RECT'
+$haveRect = $false
 if (($hwnd -ne [IntPtr]::Zero) -and $hide) {
   $zoomed = [ShotFreeze]::IsZoomed($hwnd)
+  $haveRect = [ShotFreeze]::GetWindowRect($hwnd, [ref]$savedRect)
+  # No temp state file: the restore side asks Windows for the window placement
+  # (rcNormalPosition + WPF_RESTORETOMAXIMIZED) instead of trusting a file that can
+  # outlive the run and put the window back at an old size.
   [void][ShotFreeze]::ShowWindow($hwnd, 6)
   $minimized = $true
-  Start-Sleep -Milliseconds 220
+  Start-Sleep -Milliseconds 260
+}
+
+function Restore-Owner {
+  if (-not $minimized) { return }
+  # DSHSS_DEFER_RESTORE=1 keeps the host minimised until the overlay exits, so the
+  # window never pops back behind the frozen frame and cannot be a snap target.
+  if ($env:DSHSS_DEFER_RESTORE -eq '1') { return }
+  if ($zoomed) {
+    [void][ShotFreeze]::ShowWindow($hwnd, 3)
+  }
+  else {
+    [void][ShotFreeze]::ShowWindow($hwnd, 9)
+    if ($haveRect) {
+      [void][ShotFreeze]::SetWindowPos(
+        $hwnd, [IntPtr](-2), $savedRect.Left, $savedRect.Top,
+        ($savedRect.Right - $savedRect.Left), ($savedRect.Bottom - $savedRect.Top), 0x0034
+      )
+    }
+  }
+  [void][ShotFreeze]::SetForegroundWindow($hwnd)
 }
 try {
 $left = [ShotFreeze]::GetSystemMetrics(76)
@@ -458,14 +393,12 @@ $graphics.CopyFromScreen($left, $top, 0, 0, $bitmap.Size, [System.Drawing.CopyPi
 $graphics.Dispose()
 $bitmap.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
 $bitmap.Dispose()
+Restore-Owner
 $zoomFlag = if ($zoomed) { '1' } else { '0' }
 Write-Output ("$width,$height,$left,$top|" + [int64]$hwnd + "|" + $zoomFlag)
 } catch {
-  # Never leave the app minimized just because the capture failed.
-  if ($minimized) {
-    if ($zoomed) { [void][ShotFreeze]::ShowWindow($hwnd, 3) } else { [void][ShotFreeze]::ShowWindow($hwnd, 9) }
-    Start-Sleep -Milliseconds 80
-  }
+  # Never leave the app minimized just because this failed.
+  Restore-Owner
   throw
 }
 `
@@ -473,24 +406,71 @@ Write-Output ("$width,$height,$left,$top|" + [int64]$hwnd + "|" + $zoomFlag)
 // The picker owns the screen; the DSH window stays minimized until it exits, so
 // the user never sees it flash back before the dim layer is up.
 const SHOW_OWNER_SCRIPT = String.raw`
+$ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Stop'
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
+public struct ShotRect { public int Left, Top, Right, Bottom; }
+[StructLayout(LayoutKind.Sequential)]
+public struct ShotPoint { public int X, Y; }
+[StructLayout(LayoutKind.Sequential)]
+public struct ShotPlacement {
+  public int length;
+  public int flags;
+  public int showCmd;
+  public ShotPoint ptMin;
+  public ShotPoint ptMax;
+  public ShotRect normal;
+}
 public class ShotShow {
+  [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr v);
   [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+  [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr h, ref ShotPlacement p);
 }
 "@
 $hwnd = [IntPtr][int64]$env:DSHSS_HWND
-if (-not [ShotShow]::IsWindow($hwnd)) { Write-Output 'gone'; exit 0 }
-$mode = 9
-if ($env:DSHSS_ZOOMED -eq '1') { $mode = 3 }
-[void][ShotShow]::ShowWindow($hwnd, $mode)
-Start-Sleep -Milliseconds 90
+if ($hwnd -eq [IntPtr]::Zero -or -not [ShotShow]::IsWindow($hwnd)) { Write-Output 'gone'; exit 0 }
+
+# Without this the process is DPI-virtualised at 150% scaling: GetWindowPlacement hands back
+# virtual pixels and SetWindowPos then writes them as physical ones, so every screenshot grew
+# the window by 1.5x. This is the root cause of the recurring "window got bigger" reports.
+[void][ShotShow]::SetProcessDpiAwarenessContext([IntPtr](-4))
+
+# Someone (or the user) already brought the window back: touching it now is what made it
+# jump to a stale size, so the only safe action is nothing.
+if (-not [ShotShow]::IsIconic($hwnd)) { Write-Output 'visible'; exit 0 }
+
+$placement = New-Object 'ShotPlacement'
+$placement.length = [System.Runtime.InteropServices.Marshal]::SizeOf([type]'ShotPlacement')
+$placed = [ShotShow]::GetWindowPlacement($hwnd, [ref]$placement)
+$wantMax = $false
+if ($placed) {
+  # WPF_RESTORETOMAXIMIZED: the window was minimised while maximised.
+  if (($placement.flags -band 2) -ne 0 -or $placement.showCmd -eq 3) { $wantMax = $true }
+}
+
+if ($wantMax) {
+  [void][ShotShow]::ShowWindow($hwnd, 3)
+  Write-Output 'maximized'
+} else {
+  [void][ShotShow]::ShowWindow($hwnd, 9)
+  if ($placed) {
+    $width = $placement.normal.Right - $placement.normal.Left
+    $height = $placement.normal.Bottom - $placement.normal.Top
+    if ($width -ge 200 -and $height -ge 200) {
+      [void][ShotShow]::SetWindowPos(
+        $hwnd, [IntPtr](-2), $placement.normal.Left, $placement.normal.Top, $width, $height, 0x0034
+      )
+    }
+  }
+  Write-Output 'restored'
+}
 [void][ShotShow]::SetForegroundWindow($hwnd)
-Write-Output 'shown'
 `
 
 function runPowerShellFile(file, args, timeoutMs) {
@@ -539,6 +519,14 @@ function runPowerShellFile(file, args, timeoutMs) {
           .filter(Boolean)
           .slice(-3)
           .join(' ')
+        // Windows PowerShell reports -1 (4294967295) when the overlay is torn down while it is
+        // still initialising, e.g. an Esc arriving before the windows exist. From the caller's
+        // point of view nothing was selected, so report a cancel rather than a hard failure --
+        // but keep the detail so a real crash stays diagnosable in the client log.
+        if (/^\s*\{/.test(stdout) === false) {
+          resolve({ ok: true, stdout: '', note: detail || `the picker exited with code ${code}` })
+          return
+        }
         resolve({ ok: false, message: detail || `the picker exited with code ${code}` })
         return
       }
@@ -580,12 +568,31 @@ async function pickRegionOverlay(hideWindow) {
   const started = Date.now()
 
   try {
+    // Boot the overlay first: PowerShell start-up plus WPF assembly loading costs about a
+    // second, and it can run while GDI is still copying the desktop into `frozen`. The
+    // overlay script waits for that file to appear (and to stop growing) before painting.
+    const pickPromise = runPowerShellFile(
+      overlayScriptWithBom(),
+      ['-Image', frozen, '-Out', cropped],
+      OVERLAY_TIMEOUT_MS,
+    )
+
     const freeze = await runPowerShell(
       FREEZE_SCRIPT,
-      { DSHSS_OUT: frozen, DSHSS_OWNER: 'DeepSeek Harness', DSHSS_HIDE: hideWindow ? '1' : '0' },
+      {
+        DSHSS_OUT: frozen,
+        DSHSS_OWNER: 'DeepSeek Harness',
+        DSHSS_HIDE: hideWindow ? '1' : '0',
+        DSHSS_DEFER_RESTORE: hideWindow ? '1' : '0',
+        DSHSS_STATE: WINDOW_STATE_PATH,
+      },
       CAPTURE_TIMEOUT_MS,
     )
-    if (!freeze.ok) return freeze
+    if (!freeze.ok) {
+      // The overlay gives up after its own image deadline; collect it so it cannot linger.
+      await pickPromise.catch(() => undefined)
+      return freeze
+    }
 
     const [geometry, hwndRaw, zoomRaw] = String(freeze.stdout ?? '').trim().split('|')
     const ownerHwnd = Number.parseInt(hwndRaw ?? '0', 10)
@@ -597,18 +604,14 @@ async function pickRegionOverlay(hideWindow) {
       if (!hideWindow || !Number.isFinite(ownerHwnd) || ownerHwnd <= 0) return
       await runPowerShell(
         SHOW_OWNER_SCRIPT,
-        { DSHSS_HWND: String(ownerHwnd), DSHSS_ZOOMED: ownerZoomed ? '1' : '0' },
+        { DSHSS_HWND: String(ownerHwnd) },
         WINDOW_TIMEOUT_MS,
       )
     }
 
     let pick
     try {
-      pick = await runPowerShellFile(
-        overlayScriptWithBom(),
-        ['-Image', frozen, '-Out', cropped],
-        OVERLAY_TIMEOUT_MS,
-      )
+      pick = await pickPromise
     } finally {
       await showOwner()
     }
@@ -620,7 +623,9 @@ async function pickRegionOverlay(hideWindow) {
       .filter((item) => item.startsWith('{'))
       .pop()
     if (line === undefined) {
-      return { ok: false, message: `the picker returned no result: ${JSON.stringify(pick.stdout.slice(0, 200))}` }
+      // No result line at all: the overlay was closed before it could report anything, which is
+      // a cancel, not a failure.
+      return { ok: true, cancelled: true, reason: pick.note ?? 'no-result', elapsedMs: Date.now() - started }
     }
 
     let parsed

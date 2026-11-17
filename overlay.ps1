@@ -73,7 +73,11 @@ public class ShotState {
 if ($env:OVERLAY_TRACE -eq '1') { Set-PSDebug -Trace 1 }
 $script:logPath = Join-Path $env:TEMP 'overlay-v2.log'
 function Write-Diag([string] $Text) {
-  try { [System.IO.File]::AppendAllText($script:logPath, ($Text + [Environment]::NewLine), [System.Text.Encoding]::UTF8) } catch { }
+  try {
+    $elapsed = 0
+    if ($null -ne $script:bootWatch) { $elapsed = $script:bootWatch.ElapsedMilliseconds }
+    [System.IO.File]::AppendAllText($script:logPath, ("[+$elapsed ms] " + $Text + [Environment]::NewLine), [System.Text.Encoding]::UTF8)
+  } catch { }
 }
 function Set-PointerCursor($cursor) {
   try { [System.Windows.Input.Mouse]::OverrideCursor = $cursor } catch { }
@@ -97,6 +101,30 @@ trap {
   exit 1
 }
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
+# Windows can hand the fresh overlay a stray pointer event (the window appears under a
+# cursor that was already pressed somewhere else). Ignore input for the first moments so
+# the overlay never closes itself or jumps into edit mode before the user touches it.
+$script:bootWatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+# The host starts this process the moment the user clicks the camera, before the frozen
+# screenshot has finished being written, so PowerShell startup and WPF assembly loading
+# overlap the capture instead of queueing behind it. Wait for a complete file: the image
+# appears as soon as GDI starts writing, so require two stable sizes before reading it.
+$imageDeadline = 8000
+$lastSize = -1
+while ($true) {
+  if (Test-Path -LiteralPath $Image) {
+    $size = -1
+    try { $size = (Get-Item -LiteralPath $Image).Length } catch { $size = -1 }
+    if ($size -gt 0 -and $size -eq $lastSize) { break }
+    $lastSize = $size
+  }
+  if ($script:bootWatch.ElapsedMilliseconds -gt $imageDeadline) {
+    Write-Output '{"cancelled":true,"reason":"no-image"}'
+    exit 0
+  }
+  Start-Sleep -Milliseconds 25
+}
 
 $MARK = [System.Windows.Media.Color]::FromRgb(244, 63, 94)
 $MARK_BRUSH = New-Object System.Windows.Media.SolidColorBrush($MARK)
@@ -197,6 +225,11 @@ function Update-Shade {
     $info.shadeAll.Visibility = 'Visible'
     if ($null -ne $info.veil) { $info.veil.Visibility = 'Collapsed' }
     foreach ($s in @($info.shadeTop, $info.shadeBottom, $info.shadeLeft, $info.shadeRight)) { $s.Visibility = 'Collapsed' }
+    # The hover preview sets a rect on every mouse move and clears it when the pointer
+    # leaves the window. Without collapsing the outline here the dashed border stays
+    # painted where it was last drawn (looks like a leftover frame on the desktop).
+    $info.sel.Visibility = 'Collapsed'
+    $info.annot.Clip = $null
     return
   }
   $info.shadeAll.Visibility = 'Collapsed'
@@ -340,7 +373,7 @@ function Get-HandleAt($w, $p) {
   try {
     $r = $w.rect
     if ($null -eq $r) { return $null }
-    $t = 7
+    $t = 12
     if (($p.X -lt ($r.x - $t)) -or ($p.X -gt ($r.x + $r.w + $t)) -or ($p.Y -lt ($r.y - $t)) -or ($p.Y -gt ($r.y + $r.h + $t))) { return $null }
     $nearL = [Math]::Abs($p.X - $r.x) -le $t
     $nearR = [Math]::Abs($p.X - ($r.x + $r.w)) -le $t
@@ -651,6 +684,7 @@ foreach ($i in 0..(($monitors.Length / 4) - 1)) {
   $grid.add_MouseLeftButtonDown({
       param($s, $e)
   try {
+      if ($script:bootWatch.ElapsedMilliseconds -lt 350) { Write-Diag ('DOWN ignored (boot) src=' + $script:phase); return }
       $w = $s.Tag
       $p = $e.GetPosition($s)
       $script:active = $w
@@ -1007,6 +1041,8 @@ foreach ($i in 0..(($monitors.Length / 4) - 1)) {
   $grid.add_MouseRightButtonDown({
       param($s, $e)
   try {
+      if ($script:bootWatch.ElapsedMilliseconds -lt 700) { Write-Diag 'RIGHTDOWN ignored (boot)'; return }
+      if ($e.ChangedButton -ne [System.Windows.Input.MouseButton]::Right) { return }
       $e.Handled = $true
       Write-Diag 'RIGHTDOWN'
       Invoke-Escape

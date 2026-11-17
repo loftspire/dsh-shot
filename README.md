@@ -117,6 +117,7 @@ dsh plugin add @loftspire/dsh-shot --profile <profile>
 
 ## 版本
 
+- **0.2.6** —— 修掉「截完图窗口被拉大 / 标题栏按钮消失」：还原窗口的 PowerShell 现在声明 DPI 感知，并且只在窗口确实被最小化时才按 `GetWindowPlacement` 放回原位；隐藏本窗口改为覆盖层就绪后再还原，不再闪两次、也不再吸附到自己。同时加入 `test/regression.mjs` 回归套件（13 项检查，含窗口几何/标题栏样式/悬停吸附/拖动/手柄缩放/出图）。
 - **0.2.5** —— 修掉改名后的致命问题：`client.js` 的 `__ModuleLoader__.load({ id })` 仍写旧包名，作用域包名下 client 半不注册、相机按钮消失；`id` 已改成 `@loftspire/dsh-shot`。
 - **0.2.4** —— 包名改为 `@loftspire/dsh-shot` 并发布到 npm，同时保留 GitHub Release tarball 安装。
 - **0.2.3** —— 覆盖层整屏化（宿主分层窗口）、悬停即选整窗、选区可移动/八手柄缩放、工具条去掉马赛克与文字、系统十字光标、修复悬停框偏移与工具条中文乱码。
