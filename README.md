@@ -22,32 +22,46 @@ Screenshot button for the DeepSeek Harness composer. Click the camera, the whole
 
 插件分两半：host 半（`index.js`，真的抓屏）与 client 半（`client.js`，按钮与兜底遮罩）。
 
-**从 npm 装（推荐）：**
+**从插件市场或 npm 装（推荐的日常装法，能收到后续更新）：**
 
 ```bash
 dsh plugin add @loftspire/dsh-shot --profile <profile>
 ```
 
-装完重启桌面端，输入框左侧即出现相机图标。
+也可以在 DSH 的插件市场里搜 `dsh-shot` 直接点安装。装完重启桌面端，输入框左侧即出现相机图标。
 
-**从源码 / 本地目录装：**
+这种装法的依赖记成版本号，插件页显示的是**版本**；市场按 `dsh-plugin-catalog` 检查新版（检查结果缓存 30 分钟），发版后用户能看到更新。
+
+**升级到新版：**
+
+```bash
+dsh plugin add @loftspire/dsh-shot --profile <profile>
+```
+
+或直接点市场里的更新，然后重启桌面端。
+
+**本地开发安装（会显示「本地开发」，不参与市场自动更新）：**
+
+只有自己改代码时才用。依赖会被记成 `link:`（本地目录）或 `file:`（本地 `.tgz`），DSH 在插件页标记为「本地开发」，市场对它只给「恢复到线上版本」，不会提示新版本。
 
 1. 取回代码放进任意目录，例如 `D:\plugins\dsh-shot`。
 2. 在 DSH profile 的 `package.json`（`C:\Users\<you>\.dsh\profiles\<profile>\package.json`）里加依赖与 bundle：
    ```jsonc
-   "dependencies": { "dsh-shot": "link:D:/plugins/dsh-shot" },
-   "dsh": { "profile": { "bundles": [ /* … */ "dsh-shot" ] } }
+   "dependencies": { "@loftspire/dsh-shot": "link:D:/plugins/dsh-shot" },
+   "dsh": { "profile": { "bundles": [ /* … */ "@loftspire/dsh-shot" ] } }
    ```
-3. 让 `node_modules` 能解析到它。没有 pnpm 时用目录联接（管理员权限的 cmd 里 `mklink /J` 也一样）：
+3. 让 `node_modules` 能解析到它。没有 pnpm 时用目录联接：
    ```powershell
    New-Item -ItemType Junction `
-     -Path   "$env:USERPROFILE\.dsh\profiles\<profile>\node_modules\dsh-shot" `
+     -Path   "$env:USERPROFILE\.dsh\profiles\<profile>\node_modules\@loftspire\dsh-shot" `
      -Target "D:\plugins\dsh-shot"
    ```
-4. `plugin_manager` 里打开：`set_bundle(target="dsh-shot", enabled=true)`。它会把插件 import 进运行中的 composition，host 半立即生效。
+4. `plugin_manager` 里打开：`set_bundle(target="@loftspire/dsh-shot", enabled=true)`。它会把插件 import 进运行中的 composition，host 半立即生效。
 5. **client 半要重启桌面端**（生产构建没有重载渲染进程的入口）。重启后输入框左侧出现相机图标。
 
 改过 `client.js` 之后连做三步：`set_bundle(false)` → `set_bundle(true)` → 重启 DSH。只重跑 `enabled=true` 会返回 `changed:false`，因为组合体字节在 graph 重建时已进内存缓存，而渲染进程的 URL rev 由文件 `mtime` 推导，不重启拿不到新字节。
+
+从 `link:` 切回市场装法：`dsh plugin remove @loftspire/dsh-shot --profile <profile>` 再按上面的 npm 命令装一次。
 
 ## 用法
 
